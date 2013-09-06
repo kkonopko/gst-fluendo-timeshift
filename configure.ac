@@ -44,6 +44,7 @@ dnl *** checks for platform ***
 
 dnl check for fseeko()
 AC_FUNC_FSEEKO
+AC_SYS_LARGEFILE
 
 dnl * hardware/architecture *
 

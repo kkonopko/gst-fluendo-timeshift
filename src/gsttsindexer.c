@@ -55,8 +55,12 @@ GST_DEBUG_CATEGORY_STATIC (gst_ts_indexer_debug_category);
 #define GSTTIME_TO_MPEGTIME(time) (gst_util_uint64_scale ((time), \
             CLOCK_BASE, GST_MSECOND/10))
 
-/* prototypes */
+#define MAX_PCR (1ULL << 33)
 
+/* minimum gap in PCRs beyond which it will be considered a discontinuity */
+#define MPEGTS_MAX_PCR_INTERVAL (CLOCK_FREQ*10)
+
+/* prototypes */
 
 static void gst_ts_indexer_set_property (GObject * object,
     guint property_id, const GValue * value, GParamSpec * pspec);
@@ -165,12 +169,17 @@ gst_ts_indexer_init (GstTSIndexer * indexer)
   indexer->pcr_pid = INVALID_PID;
   indexer->delta = DEFAULT_DELTA;
 
-  indexer->base_time = GST_CLOCK_TIME_NONE;
-  indexer->last_pcr = 0;
+  indexer->last_pcr = -1;
+  indexer->new_pcr = 0;
   indexer->last_time = GST_CLOCK_TIME_NONE;
   indexer->current_offset = 0;
+  indexer->pcr_counter_delta = 0;
 }
 
+/**
+ * gst_ts_indexer_replace_index: 
+ * @new_index: (allow-none) (transfer full): Replacement index
+ */
 static void
 gst_ts_indexer_replace_index (GstTSIndexer * base,
     GstIndex * new_index, gboolean own)
@@ -180,13 +189,12 @@ gst_ts_indexer_replace_index (GstTSIndexer * base,
     base->index = NULL;
   }
   if (new_index) {
-    gst_object_ref (new_index);
     base->index = new_index;
     base->own_index = own;
   }
 }
 
-void
+static void
 gst_ts_indexer_set_property (GObject * object, guint property_id,
     const GValue * value, GParamSpec * pspec)
 {
@@ -213,7 +221,7 @@ gst_ts_indexer_set_property (GObject * object, guint property_id,
   }
 }
 
-void
+static void
 gst_ts_indexer_get_property (GObject * object, guint property_id,
     GValue * value, GParamSpec * pspec)
 {
@@ -239,7 +247,7 @@ gst_ts_indexer_get_property (GObject * object, guint property_id,
   }
 }
 
-void
+static void
 gst_ts_indexer_dispose (GObject * object)
 {
   GstTSIndexer *indexer = GST_TS_INDEXER (object);
@@ -348,7 +356,7 @@ gst_ts_indexer_parse_pcr (GstTSIndexer * ts, guint8 * data)
   guint64 pcr = (guint64) - 1, pcr_ext;
 
   if (TS_PACKET_SYNC_CODE == data[0]) {
-    /* Check Adaptation field, if it == b10 or b11 */
+    /* Check Adaptation field, if it == b10 or b11  */
     if (data[3] & 0x20) {
       /* Check PID Match */
       pid = GST_READ_UINT16_BE (data + 1);
@@ -358,8 +366,7 @@ gst_ts_indexer_parse_pcr (GstTSIndexer * ts, guint8 * data)
         /* Check Adaptation field size */
         if (data[4]) {
           /* Check if random access flag is present */
-          if (ts->delta == -1 && GST_CLOCK_TIME_IS_VALID (ts->base_time) &&
-              !(data[5] & 0x40)) {
+          if (ts->delta == -1 && (ts->last_pcr == -1) && !(data[5] & 0x40)) {
             /* random access flag not set just skip after first PCR */
             goto beach;
           }
@@ -422,7 +429,6 @@ gst_ts_indexer_get_pcr (GstTSIndexer * ts,
 static void
 gst_ts_indexer_collect_time (GstTSIndexer * base, guint8 * data, gsize size)
 {
-
   GstTSIndexer *ts = GST_TS_INDEXER (base);
   GstClockTime time;
   gsize remaining = size;
@@ -436,13 +442,27 @@ gst_ts_indexer_collect_time (GstTSIndexer * base, guint8 * data, gsize size)
   offset = ts->current_offset;
   while (remaining >= TS_MIN_PACKET_SIZE) {
     pcr = gst_ts_indexer_get_pcr (ts, &data, &remaining, &offset);
+
     if (pcr != (guint64) - 1) {
-      /* FIXME: handle wraparounds */
-      if (!GST_CLOCK_TIME_IS_VALID (ts->base_time)) {
-        /* First time we receive is time zero */
-        ts->base_time = MPEGTIME_TO_GSTTIME (pcr);
+
+      if (ts->last_pcr == -1) {
+        ts->last_pcr = pcr;
       }
-      time = MPEGTIME_TO_GSTTIME (pcr) - ts->base_time;
+
+      gint64 new_delta = (pcr + MAX_PCR - ts->last_pcr) % MAX_PCR;
+
+      /* deal with discontinouities */
+      if (new_delta > MPEGTS_MAX_PCR_INTERVAL * 100) {
+        /* we moved too far so use the old delta */
+        new_delta = ts->pcr_counter_delta;
+      }
+      ts->pcr_counter_delta = new_delta;
+
+      /* keep the "virtual" pcr running at the same speed */
+
+      ts->new_pcr += ts->pcr_counter_delta;
+
+      time = MPEGTIME_TO_GSTTIME (ts->new_pcr);
 
       GST_LOG_OBJECT (ts, "found PCR %" G_GUINT64_FORMAT
           "(%" GST_TIME_FORMAT ") at offset %" G_GUINT64_FORMAT

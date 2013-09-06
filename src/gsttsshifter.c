@@ -18,11 +18,18 @@
  * Boston, MA 02110-1301, USA.
  */
 
+#define _GNU_SOURCE
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
 #include "gsttsshifter.h"
+
+/* For sync_file_range and posix_fadvise */
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 #include <glib/gstdio.h>
 
@@ -37,15 +44,11 @@ enum
 };
 
 /* default property values */
-#define DEFAULT_RECORDING_REMOVE   TRUE
-#define DEFAULT_MIN_CACHE_SIZE     (4 * CACHE_SLOT_SIZE)        /* 4 cache slots */
-#define DEFAULT_CACHE_SIZE         (256 * 1024 * 1024)  /* 256 MB */
 
 enum
 {
   PROP_0,
-  PROP_CACHE_SIZE,
-  PROP_ALLOCATOR_NAME,
+  PROP_BACKING_STORE_FD,
   PROP_LAST
 };
 
@@ -88,6 +91,8 @@ enum
 G_DEFINE_TYPE (GstTSShifter, gst_ts_shifter, GST_TYPE_ELEMENT);
 #define parent_class gst_ts_shifter_parent_class
 
+#define MByte (1024 * 1024)
+
 static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS ("video/mpegts"));
 
@@ -95,6 +100,32 @@ static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS ("video/mpegts"));
 
 static guint gst_ts_shifter_signals[LAST_SIGNAL] = { 0 };
+
+static int
+create_backing_store (GstTSShifter * ts, off64_t size)
+{
+  int fd = -1;
+  char tmpfilename[] = "/var/tmp/gst_fluendo_timeshift.XXXXXX";
+  fd = mkstemp (tmpfilename);
+  if (fd == -1) {
+    GST_ELEMENT_ERROR (ts, RESOURCE, OPEN_READ_WRITE,
+        ("Could not create temporary file for timeshift backing store"),
+        GST_ERROR_SYSTEM);
+    goto err_create;
+  }
+  g_warn_if_fail (unlink (tmpfilename) == 0);
+  if (fallocate (fd, 0, 0, size) != 0) {
+    GST_ELEMENT_ERROR (ts, RESOURCE, OPEN_READ_WRITE,
+        ("Allocating space for timeshift backing store failed"),
+        GST_ERROR_SYSTEM);
+    goto err_alloc;
+  }
+  return fd;
+err_alloc:
+  close (fd);
+err_create:
+  return -1;
+}
 
 static void
 gst_ts_shifter_start (GstTSShifter * ts)
@@ -105,36 +136,16 @@ gst_ts_shifter_start (GstTSShifter * ts)
     ts->cache = NULL;
   }
 
-  ts->cache = gst_ts_cache_new (ts->cache_size, ts->allocator_name);
-
   gst_segment_init (&ts->segment, GST_FORMAT_BYTES);
-  FLOW_MUTEX_UNLOCK (ts);
-}
 
-static void
-gst_ts_shifter_set_allocator (GstTSShifter * ts, const gchar * allocator)
-{
-  GstState state;
-
-  /* the element must be stopped in order to do this */
-  GST_OBJECT_LOCK (ts);
-  state = GST_STATE (ts);
-  if (state != GST_STATE_READY && state != GST_STATE_NULL)
-    goto wrong_state;
-  GST_OBJECT_UNLOCK (ts);
-
-  /* set new location */
-  g_free (ts->allocator_name);
-  ts->allocator_name = g_strdup (allocator);
-
-  return;
-
-/* ERROR */
-wrong_state:
-  {
-    GST_WARNING_OBJECT (ts, "setting allocator-name property in wrong state");
-    GST_OBJECT_UNLOCK (ts);
+  if (ts->backing_store_fd == -1)
+    ts->backing_store_fd = create_backing_store (ts, 512 * MByte);
+  if (ts->backing_store_fd == -1) {
+    GST_ERROR ("Failed to create backing store");
+  } else {
+    ts->cache = gst_ts_cache_new (ts->backing_store_fd);
   }
+  FLOW_MUTEX_UNLOCK (ts);
 }
 
 /* Pop a buffer from the cache and push it downstream.
@@ -324,7 +335,8 @@ out_leaking:
   {
     gboolean emit_overrun = FALSE;
 
-    GST_CAT_LOG_OBJECT (ts_flow, ts, "leaking %" G_GSIZE_FORMAT " bytes of data", size);
+    GST_CAT_LOG_OBJECT (ts_flow, ts,
+        "leaking %" G_GSIZE_FORMAT " bytes of data", size);
     if (!ts->is_leaking) {
       ts->is_leaking = TRUE;
       emit_overrun = TRUE;
@@ -452,6 +464,12 @@ gst_ts_shifter_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
     case GST_EVENT_STREAM_START:
     {
       gst_event_replace (&ts->stream_start_event, event);
+      gst_event_unref (event);
+      break;
+    }
+    case GST_EVENT_CAPS:
+    {
+      /* we swallow this event to make some upstream elements happy */
       gst_event_unref (event);
       break;
     }
@@ -843,11 +861,10 @@ gst_ts_shifter_set_property (GObject * object,
   FLOW_MUTEX_LOCK (ts);
 
   switch (prop_id) {
-    case PROP_CACHE_SIZE:
-      ts->cache_size = g_value_get_uint64 (value);
-      break;
-    case PROP_ALLOCATOR_NAME:
-      gst_ts_shifter_set_allocator (ts, g_value_get_string (value));
+    case PROP_BACKING_STORE_FD:
+      /* Has no effect until the timeshifer is restarted.  We take ownership. */
+      close (ts->backing_store_fd);
+      ts->backing_store_fd = g_value_get_int (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -866,11 +883,8 @@ gst_ts_shifter_get_property (GObject * object,
   FLOW_MUTEX_LOCK (ts);
 
   switch (prop_id) {
-    case PROP_CACHE_SIZE:
-      g_value_set_uint64 (value, ts->cache_size);
-      break;
-    case PROP_ALLOCATOR_NAME:
-      g_value_set_string (value, ts->allocator_name);
+    case PROP_BACKING_STORE_FD:
+      g_value_set_int (value, ts->backing_store_fd);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -893,6 +907,11 @@ gst_ts_shifter_finalize (GObject * object)
   g_free (ts->allocator_name);
   if (ts->cache) {
     gst_ts_cache_unref (ts->cache);
+  }
+
+  if (ts->backing_store_fd >= 0) {
+    close (ts->backing_store_fd);
+    ts->backing_store_fd = -1;
   }
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -935,18 +954,11 @@ gst_ts_shifter_class_init (GstTSShifterClass * klass)
       g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
 
   /* properties */
-  g_object_class_install_property (gclass, PROP_CACHE_SIZE,
-      g_param_spec_uint64 ("cache-size",
-          "Cache size in bytes",
-          "Max. amount of data cached in memory (bytes)",
-          DEFAULT_MIN_CACHE_SIZE, G_MAXUINT64, DEFAULT_CACHE_SIZE,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-  g_object_class_install_property (gclass, PROP_ALLOCATOR_NAME,
-      g_param_spec_string ("allocator-name", "Allocator name",
-          "The allocator to be used to allocate space for "
-          "the ring buffer (NULL - default system allocator).",
-          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gclass, PROP_BACKING_STORE_FD,
+      g_param_spec_int ("backing-store-fd",
+          "Backing store FD",
+          "File descriptor of a file in which to store video stream",
+          -1, G_MAXINT, -1, G_PARAM_READWRITE | G_PARAM_CONSTRUCT));
 
   /* set several parent class virtual functions */
   gclass->finalize = gst_ts_shifter_finalize;
@@ -993,7 +1005,8 @@ gst_ts_shifter_init (GstTSShifter * ts)
   ts->allocator_name = NULL;
 
   ts->cache = NULL;
-  ts->cache_size = DEFAULT_CACHE_SIZE;
+
+  ts->backing_store_fd = -1;
 
   GST_DEBUG_OBJECT (ts, "initialized time shifter");
 }

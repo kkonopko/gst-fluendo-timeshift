@@ -134,6 +134,10 @@ gst_ts_seeker_init (GstTSSeeker * seeker)
 {
 }
 
+/**
+ * gst_ts_seeker_replace_index: 
+ * @new_index: (allow-none) (transfer full): Replacement index
+ */
 static void
 gst_ts_seeker_replace_index (GstTSSeeker * seeker, GstIndex * new_index)
 {
@@ -142,7 +146,6 @@ gst_ts_seeker_replace_index (GstTSSeeker * seeker, GstIndex * new_index)
     seeker->index = NULL;
   }
   if (new_index) {
-    gst_object_ref (new_index);
     seeker->index = new_index;
   }
 }
@@ -222,8 +225,7 @@ gst_ts_seeker_first_offset (GstTSSeeker * ts)
   gint64 offset = -1;
 
   entry = gst_index_get_assoc_entry (ts->index,
-      GST_INDEX_LOOKUP_BEFORE, GST_ASSOCIATION_FLAG_NONE, GST_FORMAT_TIME,
-      0);
+      GST_INDEX_LOOKUP_BEFORE, GST_ASSOCIATION_FLAG_NONE, GST_FORMAT_TIME, 0);
 
   if (entry) {
     gst_index_entry_assoc_map (entry, GST_FORMAT_BYTES, &offset);
@@ -262,13 +264,12 @@ gst_ts_seeker_bytes_to_stream_time (GstTSSeeker * ts, guint64 buffer_offset,
       GST_ELEMENT_WARNING (ts, RESOURCE, FAILED,
           ("Bytes->time conversion inaccurate"),
           ("Lookup of byte offset not accurate: "
-	   "Returned byte offset %" G_GINT64_FORMAT " doesn't match "
-	   "requested offset %" G_GUINT64_FORMAT ".  Time: %" GST_TIME_FORMAT,
-	   offset, buffer_offset, GST_TIME_ARGS(time)));
+              "Returned byte offset %" G_GINT64_FORMAT " doesn't match "
+              "requested offset %" G_GUINT64_FORMAT ".  Time: %"
+              GST_TIME_FORMAT, offset, buffer_offset, GST_TIME_ARGS (time)));
     } else {
       GST_DEBUG_OBJECT (ts, "found index entry at %" GST_TIME_FORMAT
-			" pos %" G_GUINT64_FORMAT,
-			GST_TIME_ARGS (time), offset);
+          " pos %" G_GUINT64_FORMAT, GST_TIME_ARGS (time), offset);
     }
     ret = (GstClockTime) time;
   } else if (buffer_offset < gst_ts_seeker_first_offset (ts)) {
@@ -281,11 +282,10 @@ gst_ts_seeker_bytes_to_stream_time (GstTSSeeker * ts, guint64 buffer_offset,
       GST_ELEMENT_WARNING (ts, RESOURCE, FAILED,
           ("Bytes->time conversion failed"),
           ("Lookup of byte offset %" G_GUINT64_FORMAT " failed: "
-	   "No index entry for that byte offset",
-	   buffer_offset));
+              "No index entry for that byte offset", buffer_offset));
     } else {
       GST_DEBUG_OBJECT (ts, "no entry for position %" G_GUINT64_FORMAT " in %p",
-			buffer_offset, ts->index);
+          buffer_offset, ts->index);
     }
 
     ret = GST_CLOCK_TIME_NONE;

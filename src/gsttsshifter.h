@@ -60,7 +60,6 @@ struct _GstTSShifter
 
   /* the cache of data we're keeping our hands on */
   GstTSCache *cache;
-  guint64 cache_size;
 
   guint cur_bytes;              /* current position in bytes  */
 
@@ -70,6 +69,8 @@ struct _GstTSShifter
   gchar *allocator_name;
 
   GstEvent *stream_start_event;
+
+  int backing_store_fd;
 };
 
 struct _GstTSShifterClass

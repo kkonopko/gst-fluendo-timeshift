@@ -26,6 +26,7 @@
 #include "gsttsshifterbin.h"
 #include "gsttsseeker.h"
 #include "gsttsindexer.h"
+#include "gsttsstamper.h"
 
 GST_DEBUG_CATEGORY (ts_flow);
 GST_DEBUG_CATEGORY (ts_shifter);
@@ -58,6 +59,10 @@ plugin_init (GstPlugin * plugin)
 
   if (!gst_element_register (plugin, "tsindexer", GST_RANK_NONE,
           gst_ts_indexer_get_type ()))
+    return FALSE;
+
+  if (!gst_element_register (plugin, "tsstamper", GST_RANK_NONE,
+          gst_ts_stamper_get_type ()))
     return FALSE;
 
   return TRUE;

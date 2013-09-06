@@ -18,47 +18,49 @@
  * Boston, MA 02110-1301, USA.
  */
 
-#ifndef _GST_TS_INDEXER_H_
-#define _GST_TS_INDEXER_H_
+#ifndef _GST_TS_STAMPER_H_
+#define _GST_TS_STAMPER_H_
 
 #include <gst/base/gstbasetransform.h>
-#include "tsindex.h"
 
 G_BEGIN_DECLS
-#define GST_TYPE_TS_INDEXER   (gst_ts_indexer_get_type())
-#define GST_TS_INDEXER(obj)   (G_TYPE_CHECK_INSTANCE_CAST((obj),GST_TYPE_TS_INDEXER,GstTSIndexer))
-#define GST_TS_INDEXER_CLASS(klass)   (G_TYPE_CHECK_CLASS_CAST((klass),GST_TYPE_TS_INDEXER,GstTSIndexerClass))
-#define GST_IS_TS_INDEXER(obj)   (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_TS_INDEXER))
-#define GST_IS_TS_INDEXER_CLASS(obj)   (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_TS_INDEXER))
-typedef struct _GstTSIndexer GstTSIndexer;
-typedef struct _GstTSIndexerClass GstTSIndexerClass;
+#define GST_TYPE_TS_STAMPER   (gst_ts_stamper_get_type())
+#define GST_TS_STAMPER(obj)   (G_TYPE_CHECK_INSTANCE_CAST((obj),GST_TYPE_TS_STAMPER,GstTSStamper))
+#define GST_TS_STAMPER_CLASS(klass)   (G_TYPE_CHECK_CLASS_CAST((klass),GST_TYPE_TS_STAMPER,GstTSStamperClass))
+#define GST_IS_TS_STAMPER(obj)   (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_TS_STAMPER))
+#define GST_IS_TS_STAMPER_CLASS(obj)   (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_TS_STAMPER))
+typedef struct _GstTSStamper GstTSStamper;
+typedef struct _GstTSStamperClass GstTSStamperClass;
+typedef struct _GstPidTracker GstPidTracker;
 
-struct _GstTSIndexer
+struct _GstPidTracker
 {
-  GstBaseTransform base_ts_indexer;
-
-  /* Generated Index */
-  GstIndex *index;
-  gboolean own_index;
-
-  /* Properties */
-  gint16 pcr_pid;
-  GstClockTimeDiff delta;
-
-  /* PCR tracking */
+  gint64 first_pcr;
   gint64 last_pcr;
-  gint64 new_pcr;
-  guint64 current_offset;
-  guint64 pcr_counter_delta;
-  GstClockTime last_time;
+  gint64 wrap_pcr;
+  gint32 pcr_delta;
+  gint16 pcr_pid;
 };
 
-struct _GstTSIndexerClass
+struct _GstTSStamper
 {
-  GstBaseTransformClass base_ts_indexer_class;
+  GstBaseTransform base_ts_stamper;
+ 
+  /* PCR tracking */
+
+  guint64 pcr_min;
+  guint64 pcr_max;
+  
+  guint32 num_tracked_pids;
+  GstPidTracker* tracked_pids;
 };
 
-GType gst_ts_indexer_get_type (void);
+struct _GstTSStamperClass
+{
+  GstBaseTransformClass base_ts_stamper_class;
+};
+
+GType gst_ts_stamper_get_type (void);
 
 G_END_DECLS
 #endif

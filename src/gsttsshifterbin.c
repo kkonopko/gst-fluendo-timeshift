@@ -32,8 +32,7 @@ G_DEFINE_TYPE (GstTSShifterBin, gst_ts_shifter_bin, GST_TYPE_BIN);
 enum
 {
   PROP_0,
-  PROP_CACHE_SIZE,
-  PROP_ALLOCATOR_NAME,
+  PROP_BACKING_STORE_FD,
   PROP_LAST
 };
 
@@ -56,16 +55,11 @@ gst_ts_shifter_bin_set_property (GObject * object,
   GstTSShifterBin *ts_bin = GST_TS_SHIFTER_BIN (object);
 
   switch (prop_id) {
-    case PROP_CACHE_SIZE:
+    case PROP_BACKING_STORE_FD:
+      /* Forward directly onto the cache */
       g_object_set_property (G_OBJECT (ts_bin->timeshifter),
-          "cache-size", value);
+          pspec->name, value);
       break;
-
-    case PROP_ALLOCATOR_NAME:
-      g_object_set_property (G_OBJECT (ts_bin->timeshifter),
-          "allocator-name", value);
-      break;
-
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -79,14 +73,10 @@ gst_ts_shifter_bin_get_property (GObject * object,
   GstTSShifterBin *ts_bin = GST_TS_SHIFTER_BIN (object);
 
   switch (prop_id) {
-    case PROP_CACHE_SIZE:
+    case PROP_BACKING_STORE_FD:
+      /* Forward directly onto the cache */
       g_object_get_property (G_OBJECT (ts_bin->timeshifter),
-          "cache-size", value);
-      break;
-
-    case PROP_ALLOCATOR_NAME:
-      g_object_get_property (G_OBJECT (ts_bin->timeshifter),
-          "allocator-name", value);
+          pspec->name, value);
       break;
 
     default:
@@ -109,18 +99,11 @@ gst_ts_shifter_bin_class_init (GstTSShifterBinClass * klass)
   gobject_class->set_property = gst_ts_shifter_bin_set_property;
   gobject_class->get_property = gst_ts_shifter_bin_get_property;
 
-  g_object_class_install_property (gobject_class, PROP_CACHE_SIZE,
-      g_param_spec_uint64 ("cache-size",
-          "Cache size in bytes",
-          "Max. amount of data cached in memory (bytes)",
-          DEFAULT_MIN_CACHE_SIZE, G_MAXUINT64, DEFAULT_CACHE_SIZE,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-  g_object_class_install_property (gobject_class, PROP_ALLOCATOR_NAME,
-      g_param_spec_string ("allocator-name", "Allocator name",
-          "The allocator to be used to allocate space for "
-          "the ring buffer (NULL - default system allocator).",
-          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_BACKING_STORE_FD,
+      g_param_spec_int ("backing-store-fd",
+          "Backing store FD",
+          "File descriptor of a file in which to store video stream",
+          -1, G_MAXINT, -1, G_PARAM_READWRITE | G_PARAM_CONSTRUCT));
 
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&srctemplate));
@@ -155,7 +138,7 @@ mirror_pad (GstElement * element, const gchar * static_pad_name, GstBin * bin)
 static void
 gst_element_clear (GstElement ** elem)
 {
-  g_return_if_fail (!elem);
+  g_return_if_fail (elem);
   if (*elem) {
     g_object_unref (G_OBJECT (*elem));
     *elem = NULL;
@@ -178,8 +161,11 @@ gst_ts_shifter_bin_init (GstTSShifterBin * ts_bin)
 
   gst_bin_add_many (bin, ts_bin->parser, ts_bin->indexer, ts_bin->timeshifter,
       ts_bin->seeker, NULL);
-  g_return_if_fail (gst_element_link_many (ts_bin->parser, ts_bin->indexer,
-          ts_bin->timeshifter, ts_bin->seeker, NULL));
+  if (!gst_element_link_many (ts_bin->parser, ts_bin->indexer,
+          ts_bin->timeshifter, ts_bin->seeker, NULL)) {
+    g_warning ("Failed to link pipeline in timeshifter bin");
+    goto error;
+  }
 
   index = gst_index_factory_make ("memindex");
   g_object_set (G_OBJECT (ts_bin->indexer), "index", index, NULL);
@@ -192,8 +178,146 @@ gst_ts_shifter_bin_init (GstTSShifterBin * ts_bin)
   return;
 error:
   gst_element_clear (&ts_bin->parser);
+  gst_element_clear (&ts_bin->indexer);
   gst_element_clear (&ts_bin->timeshifter);
   gst_element_clear (&ts_bin->seeker);
+}
+
+/* gets a real pad peer, ie. the that is not a proxy */
+
+static GstPad *
+gst_ts_shifter_get_real_peer_pad (GstPad * pad, GstElement * common_parent)
+{
+  GstPad *peer = gst_pad_get_peer (pad);
+
+  if (GST_IS_PROXY_PAD (peer)) {
+    /* it's a proxypad so find real pad (which will be a ghostpad) */
+    GstIterator *pI = gst_pad_iterate_internal_links (peer);
+    GValue realpeer = { 0, };
+    GstIteratorResult res;
+    res = gst_iterator_next (pI, &realpeer);
+    gst_iterator_free (pI);
+    gst_object_unref (peer);
+    if (res != GST_ITERATOR_OK) {
+      return NULL;
+    }
+
+    peer = GST_PAD (g_value_get_object (&realpeer));
+    gst_object_ref (peer);
+    g_value_unset (&realpeer);
+  }
+
+  return peer;
+}
+
+static GstPadProbeReturn
+gst_ts_shifter_pad_event_cb (GstPad * pad, GstPadProbeInfo * info,
+    gpointer user_data)
+{
+  GstElement *toremove = GST_ELEMENT (user_data);
+  GstElement *parentbin = NULL;
+  GstPad *upstreampeer = NULL;
+  GstPad *downstreampeer = NULL;
+  GstPad *srcpad, *sinkpad;
+
+  if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_DATA (info)) != GST_EVENT_EOS)
+    return GST_PAD_PROBE_OK;
+
+  parentbin = GST_ELEMENT (gst_element_get_parent (toremove));
+
+  srcpad = gst_element_get_static_pad (toremove, "src");
+  downstreampeer = gst_ts_shifter_get_real_peer_pad (srcpad, parentbin);
+  gst_object_unref (srcpad);
+
+  sinkpad = gst_element_get_static_pad (toremove, "sink");
+  upstreampeer = gst_ts_shifter_get_real_peer_pad (sinkpad, parentbin);
+  gst_object_unref (sinkpad);
+
+  gst_element_set_state (toremove, GST_STATE_NULL);
+
+  /* remove unlinks automatically */
+  GST_DEBUG_OBJECT (parentbin, "removing %" GST_PTR_FORMAT, toremove);
+  gst_bin_remove (GST_BIN (parentbin), toremove);
+
+  GST_DEBUG_OBJECT (toremove, "linking..");
+
+  if (!GST_IS_GHOST_PAD (upstreampeer)
+      && !GST_IS_GHOST_PAD (downstreampeer)) {
+    gst_pad_link (upstreampeer, downstreampeer);
+  } else if (GST_IS_GHOST_PAD (upstreampeer)
+      && !GST_IS_GHOST_PAD (downstreampeer)) {
+    /* handle the case when we removed an element at the begining of a bin */
+    if (!gst_ghost_pad_set_target (GST_GHOST_PAD (upstreampeer),
+            downstreampeer)) {
+      GST_ERROR ("Couldn't set target on ghost pad.");
+    }
+  } else if (!GST_IS_GHOST_PAD (upstreampeer)
+      && GST_IS_GHOST_PAD (downstreampeer)) {
+    /* handle the case when we removed an element at the end of a bin */
+    if (!gst_ghost_pad_set_target (GST_GHOST_PAD (downstreampeer),
+            upstreampeer)) {
+      GST_ERROR ("Couldn't set target on ghost pad.");
+    }
+  } else {
+    GST_ERROR ("Couldn't connect ghost pads. Perhaps you're trying to remove"
+        " the last element from the bin?");
+  }
+  gst_object_unref (downstreampeer);
+  gst_object_unref (upstreampeer);
+
+  GST_DEBUG_OBJECT (parentbin, "done");
+  gst_object_unref (parentbin);
+
+  return GST_PAD_PROBE_DROP;
+}
+
+static GstPadProbeReturn
+gst_ts_shifter_padblocked_cb (GstPad * pad, GstPadProbeInfo * info,
+    gpointer user_data)
+{
+  GstElement *toremove = GST_ELEMENT (user_data);
+  GstPad *srcpad, *sinkpad;
+
+  GST_DEBUG_OBJECT (pad, "pad is blocked now");
+
+  /* install new probe for EOS */
+  srcpad = gst_element_get_static_pad (toremove, "src");
+  gst_pad_add_probe (srcpad, GST_PAD_PROBE_TYPE_BLOCK |
+      GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, gst_ts_shifter_pad_event_cb,
+      user_data, NULL);
+  gst_object_unref (srcpad);
+
+  sinkpad = gst_element_get_static_pad (toremove, "sink");
+  gst_pad_send_event (sinkpad, gst_event_new_eos ());
+  gst_object_unref (sinkpad);
+  /* Remove ref added in gst_ts_shifter_remove_element */
+  gst_object_unref (toremove);
+
+  return GST_PAD_PROBE_REMOVE;
+}
+
+/*
+ * A helper function that removes an element from a live pipeline/bin.
+ * It can be used while data is flowing through the pipeline.
+ */
+static void
+gst_ts_shifter_remove_element (GstElement * toremove)
+{
+  GstPad *sinkpad = gst_element_get_static_pad (toremove, "sink");
+  GstPad *blockpad = gst_pad_get_peer (sinkpad);
+  gst_object_unref (sinkpad);
+
+  /* 
+   * Add ref to make sure the element will be alive throught the process.
+   * Reference will be dropped in gst_ts_shifter_padblocked_cb when element
+   * will be already removed.
+   */
+  gst_object_ref (toremove);
+
+  gst_pad_add_probe (blockpad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
+      gst_ts_shifter_padblocked_cb, (gpointer) toremove, NULL);
+
+  gst_object_unref (blockpad);
 }
 
 static void
@@ -212,6 +336,9 @@ gst_ts_shifter_bin_handle_message (GstBin * bin, GstMessage * msg)
 
     GST_DEBUG ("Setting PCR PID: %u", pcr_pid);
     g_object_set (ts_bin->indexer, "pcr-pid", pcr_pid, NULL);
+
+    gst_ts_shifter_remove_element (ts_bin->parser);
+    ts_bin->parser = NULL;
   }
 
   GST_BIN_CLASS (gst_ts_shifter_bin_parent_class)
